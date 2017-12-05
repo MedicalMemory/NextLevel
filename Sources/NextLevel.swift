@@ -718,6 +718,16 @@ public class NextLevel: NSObject {
         }
     }
     
+    // MedMem - Paused within clip, resumable
+    public var clipPaused: Bool {
+        return _clipPaused
+    }
+    
+    // MedMem - Recording has started again in same clip
+    public var clipResumed: Bool {
+        return _clipResumed
+    }
+    
     // MARK: - private instance vars
     
     internal var _sessionQueue: DispatchQueue
@@ -759,6 +769,14 @@ public class NextLevel: NSObject {
     internal var _arConfiguration: NextLevelConfiguration?
     
     internal var _lastARFrame: CVPixelBuffer?
+    
+    // MedMem - pause and restart within clip
+    
+    internal var _clipPaused: Bool = false
+    internal var _clipResumed: Bool = false
+    internal var _pauseCorrectionOffset: CMTime = CMTimeMake(0, 0)
+    internal var _lastAudioPts: CMTime = CMTimeMake(0, 0)
+    
     
     // MARK: - singleton
     
@@ -2387,6 +2405,17 @@ extension NextLevel {
         }
     }
     
+    // MedMem - Pauses without ending clip
+    public func pauseClip() {
+        self._clipPaused = true
+    }
+    
+    // MedMem - Resumes paused clip
+    public func resumeClip() {
+        self._clipResumed = true
+        self._clipPaused = false
+    }
+    
     internal func beginRecordingNewClipIfNecessary() {
         if let session = self._recordingSession {
             if session.isReady == false {
@@ -2684,6 +2713,9 @@ extension NextLevel {
 extension NextLevel: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate {
     
     public func captureOutput(_ captureOutput: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        // MedMem
+        if clipPaused { return }
+        
         if self.captureMode == .videoWithoutAudio && captureOutput == self._videoOutput {
             self.videoDelegate?.nextLevel(self, willProcessRawVideoSampleBuffer: sampleBuffer, onQueue: self._sessionQueue)
             self._lastVideoFrame = sampleBuffer
@@ -2694,24 +2726,84 @@ extension NextLevel: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudi
         }
         else if let videoOutput = self._videoOutput,
             let audioOutput = self._audioOutput {
+            
+            // MedMem
+            if clipResumed && captureOutput == audioOutput {
+                calculatePauseCorrectionOffset(sampleBuffer: sampleBuffer)
+            }
+            var correctedBuffer = sampleBuffer
+            if _pauseCorrectionOffset.value > 0 {
+                correctedBuffer = adjustTime(sampleBuffer, by: _pauseCorrectionOffset)
+            }
+            
             switch captureOutput {
             case videoOutput:
-                self.videoDelegate?.nextLevel(self, willProcessRawVideoSampleBuffer: sampleBuffer, onQueue: self._sessionQueue)
-                self._lastVideoFrame = sampleBuffer
+                self.videoDelegate?.nextLevel(self, willProcessRawVideoSampleBuffer: correctedBuffer, onQueue: self._sessionQueue)
+                self._lastVideoFrame = correctedBuffer
                 if let session = self._recordingSession {
-                    self.handleVideoOutput(sampleBuffer: sampleBuffer, session: session)
+                    self.handleVideoOutput(sampleBuffer: correctedBuffer, session: session)
                 }
                 break
             case audioOutput:
-                self._lastAudioFrame = sampleBuffer
+                recordLastAudioPts(sampleBuffer: correctedBuffer) // MedMem
+                self._lastAudioFrame = correctedBuffer
                 if let session = self._recordingSession {
-                    self.handleAudioOutput(sampleBuffer: sampleBuffer, session: session)
+                    self.handleAudioOutput(sampleBuffer: correctedBuffer, session: session)
                 }
                 break
             default:
                 break
             }
         }
+    }
+    
+    // MedMem
+    fileprivate func calculatePauseCorrectionOffset(sampleBuffer: CMSampleBuffer) {
+        var pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        
+        let isAudioPtsValid = _lastAudioPts.flags.intersection(CMTimeFlags.valid)
+        if isAudioPtsValid.rawValue != 0 {
+            let isTimeOffsetPtsValid = _pauseCorrectionOffset.flags.intersection(CMTimeFlags.valid)
+            if isTimeOffsetPtsValid.rawValue != 0 {
+                pts = CMTimeSubtract(pts, _pauseCorrectionOffset);
+            }
+            let offset = CMTimeSubtract(pts, _lastAudioPts);
+            
+            if (_pauseCorrectionOffset.value == 0) {
+                _pauseCorrectionOffset = offset;
+            } else {
+                _pauseCorrectionOffset = CMTimeAdd(_pauseCorrectionOffset, offset);
+            }
+        }
+        _lastAudioPts.flags = CMTimeFlags()
+        _clipResumed = false
+    }
+    
+    // MedMem
+    fileprivate func adjustTime(_ sample: CMSampleBuffer, by offset: CMTime) -> CMSampleBuffer {
+        var count: CMItemCount = 0
+        CMSampleBufferGetSampleTimingInfoArray(sample, 0, nil, &count);
+        var info = [CMSampleTimingInfo](repeating: CMSampleTimingInfo(duration: CMTimeMake(0, 0), presentationTimeStamp: CMTimeMake(0, 0), decodeTimeStamp: CMTimeMake(0, 0)), count: count)
+        CMSampleBufferGetSampleTimingInfoArray(sample, count, &info, &count);
+        
+        for i in 0 ..< count {
+            info[i].decodeTimeStamp = CMTimeSubtract(info[i].decodeTimeStamp, offset);
+            info[i].presentationTimeStamp = CMTimeSubtract(info[i].presentationTimeStamp, offset);
+        }
+        
+        var out: CMSampleBuffer?
+        CMSampleBufferCreateCopyWithNewTiming(nil, sample, count, &info, &out);
+        return out!
+    }
+    
+    // MedMem
+    fileprivate func recordLastAudioPts(sampleBuffer: CMSampleBuffer) {
+        var pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        let dur = CMSampleBufferGetDuration(sampleBuffer)
+        if (dur.value > 0) {
+            pts = CMTimeAdd(pts, dur)
+        }
+        _lastAudioPts = pts
     }
     
 }
