@@ -654,7 +654,9 @@ public class NextLevel: NSObject {
         didSet {
             self.executeClosureAsyncOnSessionQueueIfNecessary {
                 self.configureSessionDevices()
-                self.updateVideoOrientation()
+                if self.automaticallyUpdatesDeviceOrientation {
+                    self.updateVideoOrientation()
+                }
             }
         }
     }
